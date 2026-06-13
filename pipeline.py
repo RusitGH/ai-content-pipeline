@@ -12,8 +12,10 @@ Modes:
 Stack:
   - Reddit API (PRAW)     → reddit mode
   - Tavily                → news / history / spiritual modes
-  - Anthropic Claude      → scriptwriting + copyright-safe rewriting
-  - ElevenLabs            → text-to-speech narration
+  - Local template writer → default spiritual scriptwriting
+  - Anthropic Claude      → optional scriptwriting upgrade
+  - macOS say             → default local test narration
+  - ElevenLabs            → optional production text-to-speech narration
   - Pexels                → royalty-free background footage (CC0)
   - FFmpeg                → compose final 9:16 vertical video
 """
@@ -27,14 +29,15 @@ import random
 import textwrap
 import subprocess
 import sys
+import shutil
 from datetime import datetime
 from pathlib import Path
 
-import requests
-import praw
-from anthropic import Anthropic
-from tavily import TavilyClient
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv():
+        return False
 
 load_dotenv()
 
@@ -47,57 +50,157 @@ REDDIT_USER_AGENT    = os.getenv("REDDIT_USER_AGENT", "ContentBot/1.0")
 
 ELEVENLABS_API_KEY  = os.getenv("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")  # Rachel
+TTS_ENGINE          = os.getenv("TTS_ENGINE", "local").strip().lower()
+LOCAL_TTS_VOICE     = os.getenv("LOCAL_TTS_VOICE", "Samantha")
 
 PEXELS_API_KEY    = os.getenv("PEXELS_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 TAVILY_API_KEY    = os.getenv("TAVILY_API_KEY", "")
+ANTHROPIC_MODEL   = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
+SCRIPT_ENGINE     = os.getenv("SCRIPT_ENGINE", "template").strip().lower()
 
 OUTPUT_DIR = Path("output")
 TEMP_DIR   = Path("temp")
 
 DEFAULT_SUBREDDITS = ["AITA", "tifu", "confessions", "TrueOffMyChest"]
+DEFAULT_SPIRITUAL_TOPICS = [
+    "karma",
+    "dharma",
+    "detachment",
+    "courage",
+    "discipline",
+    "inner peace",
+    "devotion",
+    "self control",
+    "purpose",
+    "fear",
+    "grief",
+    "service",
+]
 
 VIDEO_W, VIDEO_H, VIDEO_FPS = 1080, 1920, 30
 WPS = 2.8   # words per second (ElevenLabs pacing)
+SPIRITUAL_IMAGE_COUNT = int(os.getenv("SPIRITUAL_IMAGE_COUNT", "8"))
 
 VALID_MODES = ["reddit", "news", "history", "spiritual"]
+DEFAULT_MODE = os.getenv("PIPELINE_DEFAULT_MODE", "spiritual")
+VALID_SCRIPT_ENGINES = ["template", "anthropic"]
+VALID_TTS_ENGINES = ["local", "elevenlabs"]
+
+SPIRITUAL_VISUAL_QUERIES = [
+    "ancient indian temple",
+    "hindu god statue",
+    "krishna temple india",
+    "shiva statue india",
+    "vishnu temple india",
+    "rajasthan palace",
+    "maharaja palace india",
+    "hampi temple india",
+    "khajuraho temple sculpture",
+    "varanasi temple",
+    "indian temple sculpture",
+    "golden temple india",
+]
 
 
 # ─────────────────────────────────────────────
 # UTILITIES
 # ─────────────────────────────────────────────
 
+def is_configured(value: str) -> bool:
+    if not value:
+        return False
+    lowered = value.strip().lower()
+    return not (
+        lowered.startswith("your_")
+        or lowered in {"changeme", "replace_me", "todo"}
+    )
+
+
+def uses_anthropic(mode: str) -> bool:
+    """Anthropic is optional for spiritual mode, required for legacy modes."""
+    return SCRIPT_ENGINE == "anthropic" or mode != "spiritual"
+
+
+def uses_elevenlabs() -> bool:
+    return TTS_ENGINE == "elevenlabs"
+
+
 def check_deps(mode: str):
     # FFmpeg
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        print("❌  FFmpeg not found. Install with:  brew install ffmpeg")
+        run_ffmpeg(["-version"], capture_output=True, check=True)
+    except (FileNotFoundError, RuntimeError, subprocess.CalledProcessError):
+        print("❌  FFmpeg not found. Install ffmpeg or run: python3 -m pip install -r requirements.txt")
         sys.exit(1)
 
     missing = []
-    if not ELEVENLABS_API_KEY: missing.append("ELEVENLABS_API_KEY")
-    if not PEXELS_API_KEY:     missing.append("PEXELS_API_KEY")
-    if not ANTHROPIC_API_KEY:  missing.append("ANTHROPIC_API_KEY")
-    if mode == "reddit" and (not REDDIT_CLIENT_ID or not REDDIT_CLIENT_SECRET):
+    if uses_elevenlabs() and not is_configured(ELEVENLABS_API_KEY):
+        missing.append("ELEVENLABS_API_KEY")
+    if not is_configured(PEXELS_API_KEY):     missing.append("PEXELS_API_KEY")
+    if uses_anthropic(mode) and not is_configured(ANTHROPIC_API_KEY):
+        missing.append("ANTHROPIC_API_KEY")
+    if mode == "reddit" and (not is_configured(REDDIT_CLIENT_ID) or not is_configured(REDDIT_CLIENT_SECRET)):
         missing.append("REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET")
-    if mode in ("news", "history", "spiritual") and not TAVILY_API_KEY:
+    if mode in ("news", "history", "spiritual") and not is_configured(TAVILY_API_KEY):
         missing.append("TAVILY_API_KEY")
     if missing:
         print("❌  Missing environment variables in .env:")
         for m in missing:
             print(f"    • {m}")
-        print("\n   Copy .env.example → .env and fill in the values.")
+        print("\n   Copy .env.example -> .env and fill in the values.")
+        sys.exit(1)
+    if SCRIPT_ENGINE not in VALID_SCRIPT_ENGINES:
+        print(f"❌  Invalid SCRIPT_ENGINE={SCRIPT_ENGINE}. Choose from: {VALID_SCRIPT_ENGINES}")
+        sys.exit(1)
+    if TTS_ENGINE not in VALID_TTS_ENGINES:
+        print(f"❌  Invalid TTS_ENGINE={TTS_ENGINE}. Choose from: {VALID_TTS_ENGINES}")
+        sys.exit(1)
+    if TTS_ENGINE == "local" and not shutil.which("say"):
+        print("❌  Local TTS requires macOS 'say'. Set TTS_ENGINE=elevenlabs to use ElevenLabs.")
         sys.exit(1)
 
 
+def require_package(import_name: str, package_name: str = None):
+    try:
+        return __import__(import_name)
+    except ImportError as exc:
+        name = package_name or import_name
+        raise RuntimeError(
+            f"Missing Python package '{name}'. Install dependencies with: "
+            "python3 -m pip install -r requirements.txt"
+        ) from exc
+
+
+def ffmpeg_exe() -> str:
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    try:
+        imageio_ffmpeg = require_package("imageio_ffmpeg", "imageio-ffmpeg")
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except RuntimeError:
+        return ""
+
+
+def run_ffmpeg(args: list, **kwargs):
+    exe = ffmpeg_exe()
+    if not exe:
+        raise RuntimeError(
+            "FFmpeg not found. Install ffmpeg or install Python dependencies "
+            "with imageio-ffmpeg included."
+        )
+    return subprocess.run([exe, *args], **kwargs)
+
+
 def get_audio_duration(path: Path) -> float:
-    result = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-        capture_output=True, text=True, check=True
-    )
-    return float(result.stdout.strip())
+    result = run_ffmpeg(["-i", str(path), "-f", "null", "-"], capture_output=True, text=True)
+    combined = f"{result.stdout}\n{result.stderr}"
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", combined)
+    if not match:
+        raise RuntimeError("Could not determine audio duration from FFmpeg output.")
+    hours, minutes, seconds = match.groups()
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
 def seconds_to_srt_time(s: float) -> str:
@@ -107,19 +210,179 @@ def seconds_to_srt_time(s: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:06.3f}".replace(".", ",")
 
 
-def build_srt(script: str, wps: float = WPS) -> str:
+def caption_chunks(script: str, max_words: int = 6) -> list:
+    chunks = []
     sentences = re.split(r'(?<=[.!?])\s+', script.strip())
+    for sentence in sentences:
+        words = sentence.split()
+        for i in range(0, len(words), max_words):
+            chunk = " ".join(words[i:i + max_words]).strip()
+            if chunk:
+                chunks.append(chunk)
+    return chunks
+
+
+def build_srt(script: str, wps: float = WPS) -> str:
+    chunks = caption_chunks(script)
     lines = []
     t = 0.0
-    for i, sentence in enumerate(sentences, 1):
-        words = len(sentence.split())
+    for i, chunk in enumerate(chunks, 1):
+        words = len(chunk.split())
         dur   = max(1.5, words / wps)
         start = seconds_to_srt_time(t)
         end   = seconds_to_srt_time(t + dur)
-        wrapped = "\n".join(textwrap.wrap(sentence, width=36))
+        wrapped = "\n".join(textwrap.wrap(chunk, width=20))
         lines.append(f"{i}\n{start} --> {end}\n{wrapped}\n")
         t += dur + 0.1
     return "\n".join(lines)
+
+
+def escape_ffmpeg_text(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+
+
+def hex_color_saturation(hex_color: str) -> float:
+    color = str(hex_color or "").strip().lstrip("#")
+    if len(color) != 6:
+        return 1.0
+    try:
+        r, g, b = (int(color[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    except ValueError:
+        return 1.0
+    max_c = max(r, g, b)
+    min_c = min(r, g, b)
+    if max_c == 0:
+        return 0.0
+    return (max_c - min_c) / max_c
+
+
+def is_colorful_photo(photo: dict) -> bool:
+    """Reject likely black-and-white or very flat images from Pexels."""
+    avg_color = photo.get("avg_color")
+    if not avg_color:
+        return True
+    return hex_color_saturation(avg_color) >= 0.10
+
+
+def spiritual_visual_queries(keywords: list = None) -> list:
+    cleaned = [
+        str(kw).strip()
+        for kw in (keywords or [])
+        if str(kw).strip() and str(kw).strip().lower() not in {"nature", "abstract background"}
+    ]
+    devotional = [*SPIRITUAL_VISUAL_QUERIES, *cleaned]
+    seen = set()
+    unique = []
+    for query in devotional:
+        key = query.lower()
+        if key not in seen:
+            unique.append(query)
+            seen.add(key)
+    return unique
+
+
+def daily_spiritual_topic(today: datetime = None) -> str:
+    """Pick a stable rotating topic for unattended daily spiritual runs."""
+    today = today or datetime.now()
+    index = today.timetuple().tm_yday % len(DEFAULT_SPIRITUAL_TOPICS)
+    return DEFAULT_SPIRITUAL_TOPICS[index]
+
+
+def normalize_hashtags(hashtags: list) -> list:
+    normalized = []
+    for tag in hashtags or []:
+        clean = re.sub(r"[^A-Za-z0-9_]", "", str(tag).strip().lstrip("#"))
+        if clean:
+            normalized.append(f"#{clean}")
+    defaults = ["#BhagavadGita", "#Spirituality", "#Mindfulness", "#Wisdom", "#Shorts"]
+    for tag in defaults:
+        if tag not in normalized:
+            normalized.append(tag)
+    return normalized[:8]
+
+
+def title_case_topic(topic: str) -> str:
+    return " ".join(word.capitalize() for word in str(topic or "inner peace").split())
+
+
+def write_spiritual_template_script(content: dict) -> dict:
+    """Create a Gita reflection without an LLM or Anthropic API key."""
+    topic = content.get("topic") or os.getenv("SPIRITUAL_TOPIC") or "inner peace"
+    topic_title = title_case_topic(topic)
+    title = f"Gita Wisdom for {topic_title}"[:60]
+    hook = f"When {topic} feels hard, the Gita does not ask you to run from life."
+    script = (
+        f"{hook} It asks you to meet life with a steadier mind. "
+        "The teaching is simple: offer your action fully, but do not let your peace depend on the result. "
+        "That one shift changes everything. You can still work, love, serve, build, and try again, but your heart is no longer dragged around by praise, fear, or disappointment. "
+        f"If your lesson today is {topic}, pause before reacting. Ask what duty is in front of you. Ask what response would make you cleaner inside, not louder outside. "
+        "The Gita keeps bringing us back to this quiet strength: do the right thing with sincerity, release what you cannot control, and return to the self that watches all of it. "
+        "Maybe that is the real practice today: not escaping the world, but moving through it without losing yourself."
+    )
+    return {
+        "video_title": title,
+        "script": script,
+        "hook": hook,
+        "search_keywords": [
+            "ancient indian temple",
+            "hindu god statue",
+            "krishna temple india",
+            "rajasthan palace",
+            "indian temple sculpture",
+        ],
+        "hashtags": ["#BhagavadGita", "#GitaWisdom", "#Spirituality", "#Mindfulness", "#Shorts"],
+        "script_engine": "template",
+    }
+
+
+def build_upload_metadata(content: dict, scripted: dict, video_path: Path, duration: float) -> dict:
+    """Create platform-ready metadata for TikTok, Reels, and YouTube Shorts."""
+    hashtags = normalize_hashtags(scripted.get("hashtags", []))
+    title = str(scripted.get("video_title") or content.get("title") or "Bhagavad Gita Reflection")[:90]
+    hook = str(scripted.get("hook") or scripted.get("script", "").split(".")[0]).strip()
+    caption = f"{title}\n\n{hook}\n\n{' '.join(hashtags)}"
+    description = (
+        f"{title}\n\n"
+        f"{scripted.get('script', '').strip()}\n\n"
+        f"Source reference: {content.get('source', 'Tavily research')}\n\n"
+        f"{' '.join(hashtags)}"
+    )
+    alt_text = (
+        "Vertical short-form video with peaceful background footage and narrated "
+        "Bhagavad Gita reflection captions."
+    )
+    return {
+        "publish_status": "ready_to_upload",
+        "content_lane": "gita_spiritual",
+        "mode": content.get("mode"),
+        "source": content.get("source"),
+        "video_file": str(video_path),
+        "duration_seconds": round(duration, 2),
+        "title": title,
+        "caption": caption,
+        "description": description,
+        "hashtags": hashtags,
+        "alt_text": alt_text,
+        "platforms": {
+            "tiktok": {
+                "caption": caption[:2200],
+                "hashtags": hashtags,
+                "privacy": "draft",
+            },
+            "instagram_reels": {
+                "caption": caption[:2200],
+                "hashtags": hashtags,
+                "share_to_feed": True,
+            },
+            "youtube_shorts": {
+                "title": title[:100],
+                "description": description[:5000],
+                "tags": [tag.lstrip("#") for tag in hashtags],
+                "category": "Education",
+                "made_for_kids": False,
+            },
+        },
+    }
 
 
 def system_font() -> str:
@@ -141,6 +404,7 @@ def system_font() -> str:
 
 def fetch_reddit_story(subreddit: str = None, time_filter: str = "week") -> dict:
     """Mode: reddit — pull a top post from a subreddit."""
+    praw = require_package("praw")
     if not subreddit:
         subreddit = random.choice(DEFAULT_SUBREDDITS)
 
@@ -170,6 +434,8 @@ def fetch_reddit_story(subreddit: str = None, time_filter: str = "week") -> dict
 
 def fetch_news_story(topic: str = None) -> dict:
     """Mode: news — find a trending story via Tavily."""
+    tavily_module = require_package("tavily", "tavily-python")
+    TavilyClient = tavily_module.TavilyClient
     client = TavilyClient(api_key=TAVILY_API_KEY)
     query = f"trending news story today {topic}" if topic else "most shocking surprising news story today"
     results = client.search(query, search_depth="advanced", max_results=5)
@@ -189,6 +455,8 @@ def fetch_news_story(topic: str = None) -> dict:
 
 def fetch_history_story() -> dict:
     """Mode: history — find an 'on this day' historical event via Tavily."""
+    tavily_module = require_package("tavily", "tavily-python")
+    TavilyClient = tavily_module.TavilyClient
     client = TavilyClient(api_key=TAVILY_API_KEY)
     today = datetime.now().strftime("%B %d")
     results = client.search(
@@ -210,11 +478,13 @@ def fetch_history_story() -> dict:
 
 def fetch_spiritual_verse(topic: str = None) -> dict:
     """Mode: spiritual — find a Bhagavad Gita verse + meaning via Tavily."""
+    tavily_module = require_package("tavily", "tavily-python")
+    TavilyClient = tavily_module.TavilyClient
     client = TavilyClient(api_key=TAVILY_API_KEY)
+    topic = topic or os.getenv("SPIRITUAL_TOPIC") or daily_spiritual_topic()
     query = (
-        f"Bhagavad Gita verse about {topic} full translation meaning explanation"
-        if topic else
-        "most powerful Bhagavad Gita verse full Sanskrit translation meaning life lesson"
+        f"Bhagavad Gita verse about {topic} full Sanskrit translation "
+        "meaning explanation life lesson"
     )
     results = client.search(query, search_depth="advanced", max_results=5)
 
@@ -227,6 +497,7 @@ def fetch_spiritual_verse(topic: str = None) -> dict:
         "title": best["title"],
         "body": best["content"],
         "source": best["url"],
+        "topic": topic,
     }
 
 
@@ -290,8 +561,10 @@ Background video keywords should be nature/meditation/peaceful (e.g., 'sunrise n
 }
 
 
-def write_script(content: dict) -> dict:
+def write_anthropic_script(content: dict) -> dict:
     """Use Claude to write the final video script from raw source content."""
+    anthropic_module = require_package("anthropic")
+    Anthropic = anthropic_module.Anthropic
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
     mode   = content["mode"]
     system = MODE_PROMPTS[mode]
@@ -311,7 +584,7 @@ Return ONLY valid JSON (no markdown fences):
 }}"""
 
     resp = client.messages.create(
-        model="claude-opus-4-8",
+        model=ANTHROPIC_MODEL,
         max_tokens=1024,
         system=system,
         messages=[{"role": "user", "content": user_msg}]
@@ -323,11 +596,18 @@ Return ONLY valid JSON (no markdown fences):
     return json.loads(raw)
 
 
+def write_script(content: dict) -> dict:
+    if content["mode"] == "spiritual" and not uses_anthropic("spiritual"):
+        return write_spiritual_template_script(content)
+    return write_anthropic_script(content)
+
+
 # ─────────────────────────────────────────────
-# NARRATION (ElevenLabs)
+# NARRATION
 # ─────────────────────────────────────────────
 
-def generate_narration(script: str, out_dir: Path) -> Path:
+def generate_elevenlabs_narration(script: str, out_dir: Path) -> Path:
+    requests = require_package("requests")
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
     headers = {
         "Accept": "audio/mpeg",
@@ -351,11 +631,37 @@ def generate_narration(script: str, out_dir: Path) -> Path:
     return audio_path
 
 
+def generate_local_narration(script: str, out_dir: Path) -> Path:
+    aiff_path = out_dir / "narration.aiff"
+    mp3_path = out_dir / "narration.mp3"
+    say_cmd = ["say", "-o", str(aiff_path)]
+    if LOCAL_TTS_VOICE:
+        say_cmd.extend(["-v", LOCAL_TTS_VOICE])
+    say_cmd.append(script)
+    subprocess.run(say_cmd, capture_output=True, text=True, check=True)
+
+    result = run_ffmpeg(
+        ["-y", "-i", str(aiff_path), "-codec:a", "libmp3lame", "-q:a", "4", str(mp3_path)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return aiff_path
+    return mp3_path
+
+
+def generate_narration(script: str, out_dir: Path) -> Path:
+    if uses_elevenlabs():
+        return generate_elevenlabs_narration(script, out_dir)
+    return generate_local_narration(script, out_dir)
+
+
 # ─────────────────────────────────────────────
 # BACKGROUND FOOTAGE (Pexels)
 # ─────────────────────────────────────────────
 
 def fetch_background_video(keywords: list, out_dir: Path) -> Path:
+    requests = require_package("requests")
     headers   = {"Authorization": PEXELS_API_KEY}
     fallbacks = keywords + ["peaceful nature", "city street", "abstract background"]
 
@@ -389,6 +695,99 @@ def fetch_background_video(keywords: list, out_dir: Path) -> Path:
     return bg_path
 
 
+def fetch_spiritual_background_images(keywords: list, out_dir: Path, image_count: int = SPIRITUAL_IMAGE_COUNT) -> list:
+    requests = require_package("requests")
+    headers = {"Authorization": PEXELS_API_KEY}
+    image_urls = []
+    seen_ids = set()
+
+    for query in spiritual_visual_queries(keywords):
+        resp = requests.get(
+            "https://api.pexels.com/v1/search",
+            headers=headers,
+            params={"query": query, "per_page": 12, "orientation": "portrait", "size": "large"},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            continue
+
+        photos = [photo for photo in resp.json().get("photos", []) if is_colorful_photo(photo)]
+        random.shuffle(photos)
+        for photo in photos[:2]:
+            photo_id = photo.get("id")
+            if photo_id in seen_ids:
+                continue
+            src = photo.get("src", {})
+            image_url = src.get("large2x") or src.get("portrait") or src.get("large") or src.get("original")
+            if not image_url:
+                continue
+            image_urls.append(image_url)
+            seen_ids.add(photo_id)
+            if len(image_urls) >= image_count:
+                break
+        if len(image_urls) >= image_count:
+            break
+
+    if not image_urls:
+        raise RuntimeError("Could not fetch spiritual background images from Pexels.")
+
+    image_paths = []
+    for i, image_url in enumerate(image_urls, 1):
+        image_path = out_dir / f"background_{i:02d}.jpg"
+        with requests.get(image_url, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(image_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    f.write(chunk)
+        image_paths.append(image_path)
+    return image_paths
+
+
+def build_image_montage(image_paths: list, duration: float, out_dir: Path) -> Path:
+    if not image_paths:
+        raise ValueError("At least one image is required for a montage.")
+
+    scene_duration = max(3.0, duration / len(image_paths))
+    concat_path = out_dir / "montage_inputs.txt"
+    concat_lines = []
+    for image_path in image_paths:
+        concat_lines.append(f"file '{image_path.resolve()}'")
+        concat_lines.append(f"duration {scene_duration:.3f}")
+    concat_lines.append(f"file '{image_paths[-1].resolve()}'")
+    concat_path.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+
+    montage_path = out_dir / "background_montage.mp4"
+    filter_chain = (
+        f"fps={VIDEO_FPS},"
+        f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
+        f"crop={VIDEO_W}:{VIDEO_H},setsar=1,"
+        "eq=saturation=1.28:contrast=1.05:brightness=0.015,"
+        "format=yuv420p"
+    )
+    result = run_ffmpeg(
+        [
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", str(concat_path),
+            "-t", f"{duration + 1:.3f}",
+            "-vf", filter_chain,
+            "-an",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            str(montage_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print("FFmpeg montage error:\n", result.stderr[-2000:])
+        raise RuntimeError("Image montage generation failed.")
+    return montage_path
+
+
 # ─────────────────────────────────────────────
 # VIDEO COMPOSITION (FFmpeg)
 # ─────────────────────────────────────────────
@@ -400,33 +799,37 @@ def compose_video(bg_path, audio_path, script, title, out_dir) -> Path:
     srt_path = out_dir / "captions.srt"
     srt_path.write_text(build_srt(script), encoding="utf-8")
 
-    safe_title = title.replace("'", "\\'").replace(":", "\\:").replace("\\", "\\\\")[:55]
+    safe_title = escape_ffmpeg_text(title[:55])
     font_arg   = f":fontfile='{font}'" if font else ""
 
     sub_style = (
-        "Fontsize=22,Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-        "Outline=2,Shadow=1,Alignment=2,MarginV=80"
+        "Fontsize=9,Bold=1,PrimaryColour=&H00FCE8C6,OutlineColour=&H70312018,"
+        "Outline=0.35,Shadow=0,Alignment=2,MarginV=200"
     )
 
+    escaped_srt_path = escape_ffmpeg_text(srt_path)
     filter_complex = (
         f"[0:v]"
         f"scale={VIDEO_W}:{VIDEO_H}:force_original_aspect_ratio=increase,"
-        f"crop={VIDEO_W}:{VIDEO_H},setsar=1,setpts=PTS-STARTPTS[bg];"
-        f"[bg]drawbox=x=0:y=0:w={VIDEO_W}:h={VIDEO_H}:color=black@0.45:t=fill[dark];"
-        f"[dark]drawtext=text='{safe_title}'{font_arg}:fontsize=46:fontcolor=white:"
-        f"x=(w-text_w)/2:y=80:box=1:boxcolor=black@0.55:boxborderw=18:line_spacing=6[titled];"
-        f"[titled]subtitles='{srt_path}':force_style='{sub_style}'[out]"
+        f"crop={VIDEO_W}:{VIDEO_H},setsar=1,setpts=PTS-STARTPTS,"
+        f"eq=saturation=1.18:contrast=1.04:brightness=0.01[bg];"
+        f"[bg]drawtext=text='{safe_title}'{font_arg}:fontsize=44:fontcolor=0xF6E7C4:"
+        f"x=(w-text_w)/2:y=100:shadowcolor=black@0.55:shadowx=2:shadowy=2:"
+        f"line_spacing=6[titled];"
+        f"[titled]subtitles='{escaped_srt_path}':original_size={VIDEO_W}x{VIDEO_H}:"
+        f"force_style='{sub_style}'[out]"
     )
 
     out_path = out_dir / "final_video.mp4"
     cmd = [
-        "ffmpeg", "-y",
+        "-y",
         "-stream_loop", "-1",
         "-i", str(bg_path),
         "-i", str(audio_path),
         "-t", str(math.ceil(duration) + 1),
         "-filter_complex", filter_complex,
         "-map", "[out]", "-map", "1:a",
+        "-r", str(VIDEO_FPS),
         "-c:v", "libx264", "-preset", "fast", "-crf", "22",
         "-c:a", "aac", "-b:a", "192k",
         "-shortest", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
@@ -434,7 +837,7 @@ def compose_video(bg_path, audio_path, script, title, out_dir) -> Path:
     ]
 
     print("   Running FFmpeg (~30 seconds)...")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = run_ffmpeg(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print("FFmpeg error:\n", result.stderr[-2000:])
         raise RuntimeError("FFmpeg composition failed.")
@@ -445,7 +848,7 @@ def compose_video(bg_path, audio_path, script, title, out_dir) -> Path:
 # MAIN PIPELINE
 # ─────────────────────────────────────────────
 
-def run_pipeline(mode: str = "reddit", topic: str = None, time_filter: str = "week") -> Path:
+def run_pipeline(mode: str = DEFAULT_MODE, topic: str = None, time_filter: str = "week") -> Path:
     check_deps(mode)
     OUTPUT_DIR.mkdir(exist_ok=True)
     job_dir = OUTPUT_DIR / str(int(time.time()))
@@ -468,34 +871,55 @@ def run_pipeline(mode: str = "reddit", topic: str = None, time_filter: str = "we
 
     print(f"    → {content['title'][:70]}...")
 
-    # 2. Write script with Claude
-    print("✍️   Writing script with Claude...")
+    # 2. Write script
+    writer_label = "Anthropic Claude" if uses_anthropic(mode) else "local template writer"
+    print(f"✍️   Writing script with {writer_label}...")
     scripted   = write_script(content)
     word_count = len(scripted["script"].split())
     print(f"    → Title:  {scripted['video_title']}")
     print(f"    → Script: {word_count} words (~{round(word_count/WPS)}s narration)")
 
     # Save metadata
-    meta = {**content, **scripted, "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")}
+    meta = {
+        **content,
+        **scripted,
+        "script_engine": SCRIPT_ENGINE,
+        "tts_engine": TTS_ENGINE,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
     (job_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
     (job_dir / "script.txt").write_text(scripted["script"])
 
-    # 3. ElevenLabs narration
-    print("🎙️   Generating narration (ElevenLabs)...")
+    # 3. Narration
+    tts_label = "ElevenLabs" if uses_elevenlabs() else "local macOS TTS"
+    print(f"🎙️   Generating narration ({tts_label})...")
     audio_path = generate_narration(scripted["script"], job_dir)
     duration   = get_audio_duration(audio_path)
     print(f"    → {duration:.1f}s audio")
 
     # 4. Background footage
-    print("🎥   Downloading background footage (Pexels)...")
-    bg_path = fetch_background_video(scripted.get("search_keywords", ["nature"]), job_dir)
-    print(f"    → Downloaded")
+    if mode == "spiritual":
+        print("🎥   Downloading spiritual image montage assets (Pexels)...")
+        image_paths = fetch_spiritual_background_images(scripted.get("search_keywords", []), job_dir)
+        print(f"    → Downloaded {len(image_paths)} images")
+        bg_path = build_image_montage(image_paths, duration, job_dir)
+        print("    → Built warm spiritual montage")
+    else:
+        print("🎥   Downloading background footage (Pexels)...")
+        bg_path = fetch_background_video(scripted.get("search_keywords", ["nature"]), job_dir)
+        print(f"    → Downloaded")
 
     # 5. Compose
     print("🎞️   Composing video (FFmpeg)...")
     video_path = compose_video(bg_path, audio_path, scripted["script"], scripted["video_title"], job_dir)
 
     size_mb = video_path.stat().st_size / 1_000_000
+    upload_meta = build_upload_metadata(content, scripted, video_path, duration)
+    upload_meta["visual_style"] = (
+        "Warm color spiritual montage with ancient Indian temples, deity statues, "
+        "palaces, and sacred architecture; no black-and-white treatment or heavy text boxes."
+    )
+    (job_dir / "upload_metadata.json").write_text(json.dumps(upload_meta, indent=2))
     print(f"\n✅  Done!")
     print(f"    📁  {video_path}")
     print(f"    📏  {size_mb:.1f} MB  |  ⏱️  {duration:.1f}s")
@@ -512,8 +936,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="AI short-form video pipeline.")
     parser.add_argument(
-        "--mode", "-m", default="reddit", choices=VALID_MODES,
-        help="Content type: reddit | news | history | spiritual (default: reddit)"
+        "--mode", "-m", default=DEFAULT_MODE, choices=VALID_MODES,
+        help=f"Content type: reddit | news | history | spiritual (default: {DEFAULT_MODE})"
     )
     parser.add_argument(
         "--topic", "-t", default=None,
